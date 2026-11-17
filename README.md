@@ -4,6 +4,8 @@ Restauração por etapas com liberação do destino e criação posterior de ín
 
 **Escopo:** procedimento genérico de migração lógica entre bancos PostgreSQL, aplicável a diferentes aplicações e infraestruturas, incluindo instalações próprias e serviços gerenciados que ofereçam os recursos e privilégios necessários.
 
+**Indicação de uso:** bancos PostgreSQL de grande porte, especialmente com tabelas grandes ou muitos índices de construção demorada, quando essa etapa representa uma parcela relevante da janela de manutenção. A adequação depende do volume, do tempo de criação dos índices, dos recursos disponíveis e das exigências da aplicação; não há tamanho mínimo universal.
+
 **Referência técnica:** PostgreSQL 16. Verifique compatibilidade de versões, extensões, permissões e limites do serviço no seu ambiente. `banco_exemplo`, hosts, usuários, tabelas e índices são nomes ilustrativos e devem ser substituídos.
 
 ## Objetivo e arquitetura
@@ -31,6 +33,8 @@ flowchart LR
         S1 --> CHECK
         S2 --> CHECK
     end
+    PREP["Preparação antes da migração<br/>dimensionar e validar parâmetros"]
+    PREP --> DUMP
     SRC --> DUMP
     VALID --> CUT
     CUT --> APP
@@ -41,7 +45,7 @@ flowchart LR
     S2 -->|"criação no destino"| TGT
 ```
 
-**Sequência:** restaurar estrutura e dados → concluir integridade e objetos essenciais → validar → liberar o destino → criar índices adicionais com `CONCURRENTLY` → conferir os objetos restantes.
+**Sequência:** preparar e validar parâmetros → restaurar estrutura e dados → concluir integridade e objetos essenciais → validar → liberar o destino → criar índices adicionais com `CONCURRENTLY` → conferir os objetos restantes.
 
 As sessões de índices atuam no mesmo destino usado pela aplicação. Os trabalhos podem ocorrer em paralelo em tabelas diferentes, respeitando a capacidade do servidor. As gravações na origem precisam ser interrompidas para o backup final ou tratadas por um processo de sincronização coordenado, conforme os pré-requisitos.
 
@@ -68,6 +72,38 @@ Em relação a uma carga em tabelas já indexadas, carregar os registros antes d
 PKs e constraints UNIQUE normalmente criam seus próprios índices; constraints de exclusão também dependem de índices. Esses índices pertencem à fase de integridade. Índices únicos independentes e índices exigidos por dependências ou pela aplicação também devem estar prontos antes da liberação. A etapa posterior contém apenas os índices que podem ser adiados. [2](https://www.postgresql.org/docs/16/ddl-constraints.html)
 
 Não há percentual de ganho assumido neste procedimento. Registrar os tempos de cada fase e o momento efetivo de liberação para comparar com uma restauração completa na mesma infraestrutura.
+
+## 0 Preparar e configurar o destino antes da migração
+
+Concluir o dimensionamento, o ensaio e os ajustes de servidor **antes de iniciar a migração**, incluindo recarga ou reinício quando necessário. Reservar capacidade para a aplicação que dividirá o destino com a criação dos índices após a liberação.
+
+| Parâmetro ou controle | Preparar antes da migração | Aplicar ou conferir na execução |
+| --- | --- | --- |
+| `max_worker_processes` | Dimensionar o conjunto de processos; alterações exigem reinício do servidor. | Confirmar o valor efetivo antes de iniciar. |
+| `max_parallel_workers` | Dimensionar o conjunto de workers paralelos dentro da capacidade disponível. | Conferir a capacidade compartilhada com outras cargas. |
+| `maintenance_work_mem` | Definir e testar o orçamento de memória por operação. | Aplicar o valor planejado em cada sessão de restore ou de índices que precisar dele. |
+| `max_parallel_maintenance_workers` | Definir e testar o limite de workers por construção. | Aplicar em cada sessão de criação de índices. |
+| Jobs de restore e sessões simultâneas de índices | Ensaiar a concorrência da carga e da criação junto com a aplicação. | Usar os limites planejados e reduzir a concorrência se houver degradação da aplicação. |
+
+Consultar os valores atuais no destino:
+
+```sql
+SELECT name, setting, unit, context, pending_restart
+FROM pg_settings
+WHERE name IN (
+  'maintenance_work_mem',
+  'max_parallel_maintenance_workers',
+  'max_parallel_workers',
+  'max_worker_processes'
+)
+ORDER BY name;
+```
+
+Aplicar mudanças globais pela configuração do servidor ou pelo mecanismo do serviço gerenciado. Registrar os valores originais e conferir `pending_restart` após as alterações. Não deixar ajustes que exigem reinício para o meio da migração. [Configuração de recursos](https://www.postgresql.org/docs/16/runtime-config-resource.html)
+
+**Os parâmetros de sessão continuam precisando ser aplicados na abertura de cada conexão.** Um `SET` executado em uma conexão de preparação não configura conexões futuras do `pg_restore` ou `psql`. Preparar os scripts antes da migração e executar os ajustes no início de cada sessão correspondente, antes do seu trabalho. Opções de conexão, como `PGOPTIONS`, também podem ser usadas quando suportadas. [Variáveis de conexão](https://www.postgresql.org/docs/16/libpq-envars.html)
+
+Os valores da etapa 5 são um perfil ilustrativo a validar nesta preparação, não uma recomendação para descobrir ou alterar a configuração somente após a liberação.
 
 ## 1 Preparar a migração e o backup
 
@@ -212,11 +248,11 @@ Revisar os CREATE INDEX elegíveis e gerar arquivos por sessão com CREATE INDEX
 
 ## 5 Criar índices com a aplicação em uso
 
-### Configuração por sessão e comando
+### Aplicar o perfil de sessão preparado e criar os índices
 
 **Parâmetros centrais:** `maintenance_work_mem` para memória de construção e `max_parallel_maintenance_workers` para paralelismo interno.
 
-Perfil inicial ilustrativo para ensaio, condicionado à folga de CPU, RAM e I/O. Inserir os SETs em cada arquivo executado pelo psql; configurações feitas em outra conexão não são herdadas.
+Perfil ilustrativo para dimensionar e testar antes da migração, condicionado à folga de CPU, RAM e I/O. Nesta etapa, aplicar o perfil definido na etapa 0. Inserir os SETs em cada arquivo executado pelo psql; configurações feitas em outra conexão não são herdadas.
 
 ```sql
 SET application_name = 'migracao_indices_01';
@@ -297,7 +333,7 @@ Falhas e cancelamentos de builds concorrentes podem deixar índices inválidos. 
 
 Comparar todos os índices e demais objetos com o inventário esperado. Verificar definição, validade, vínculo com constraints e partições, além dos logs de cada sessão. Registrar o término e fechar as pendências. A ausência de índices inválidos não comprova que todos os índices esperados existem.
 
-Depois de o destino receber gravações, o retorno à origem precisa reconciliar essas alterações. Não redirecionar a aplicação de volta para um banco desatualizado. Preservar o backup final e as evidências de corte conforme a política operacional.
+Depois de o destino receber gravações, o retorno à origem precisa reconciliar essas alterações. Não redirecionar a aplicação de volta para um banco desatualizado. Preservar o backup final e as evidências de corte conforme a política operacional. Encerrar as sessões exclusivas da migração e revisar ajustes globais temporários com base nos valores originais; agendar manutenção se a reversão exigir reinício.
 
 ### Referências técnicas
 
